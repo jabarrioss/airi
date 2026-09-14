@@ -582,7 +582,12 @@ export const useHearingStore = defineStore('hearing-store', () => {
   },
 })
 
-export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech:audio-input-pipeline', () => {
+/**
+ * Owns one independent transcription lifecycle. Manual composers use their own
+ * instance so cancellation cannot stop the shared always-on hearing session.
+ * The caller must stop streaming and remove its consumer before disposal.
+ */
+export function useTranscriptionSession() {
   const error = ref<string>()
 
   const hearingStore = useHearingStore()
@@ -605,7 +610,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     mediaStreamSource?: MediaStreamAudioSourceNode
     audioStreamController?: ReadableStreamDefaultController<Uint8Array>
     abortController: AbortController
-    result?: HearingTranscriptionResult & { recognition?: any }
+    result?: HearingTranscriptionResult | (ReturnType<typeof streamWebSpeechAPITranscription> & { mode: 'stream' })
     idleTimer?: ReturnType<typeof setTimeout>
     mediaStream?: MediaStream
     providerId?: string
@@ -697,20 +702,14 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     // Special handling for Web Speech API
     if (session.providerId === 'browser-web-speech-api') {
       try {
-        const reason = new DOMException(abort ? 'Aborted' : 'Stopped', 'AbortError')
-        if (!session.abortController.signal.aborted) {
-          session.abortController.abort(reason)
+        const result = session.result as ReturnType<typeof streamWebSpeechAPITranscription>
+        if (abort) {
+          session.abortController.abort(new DOMException('Aborted', 'AbortError'))
         }
-
-        // Stop Web Speech API recognition if it exists
-        const recognition: unknown = session.result?.recognition
-        if (recognition && typeof recognition === 'object' && 'stop' in recognition && typeof recognition.stop === 'function') {
-          try {
-            recognition.stop()
-          }
-          catch (err) {
-            console.warn('Error stopping Web Speech API recognition:', err)
-          }
+        else {
+          // Release must wait for result/end. Aborting here rejects the final
+          // text before browsers that finalize on stop can deliver it.
+          result.stop()
         }
       }
       catch (err) {
@@ -731,6 +730,10 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
           error.value = errorMessage(err)
           console.error('Error getting transcription result:', error.value)
+        }
+        finally {
+          if (streamingSession.value === session)
+            streamingSession.value = undefined
         }
       }
 
@@ -890,7 +893,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
 
         while (true) {
           const { done, value } = await reader.read()
-          if (done)
+          if (done || session.abortController.signal.aborted || streamingSession.value !== session)
             break
           if (session.abortController.signal.aborted)
             break
@@ -910,8 +913,10 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
         }
       }
       catch (err) {
-        if (!isExpectedStreamStopError(err))
+        if (!isExpectedStreamStopError(err) && streamingSession.value === session) {
+          error.value = errorMessage(err)
           console.error('Error reading text stream:', err)
+        }
       }
       finally {
         if (!session.abortController.signal.aborted && latestSnapshotIsFinal && fullText.trim()) {
@@ -938,6 +943,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     if (!provider)
       throw new Error('Failed to initialize speech provider')
 
+    error.value = undefined
     const abortController = new AbortController()
     const session: NonNullable<typeof streamingSession.value> = {
       audioStreamController: undefined as ReadableStreamDefaultController<Uint8Array> | undefined,
@@ -1152,6 +1158,7 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
           interimResults: (options?.providerOptions?.interimResults as boolean) ?? (providerConfig.interimResults as boolean) ?? true,
           maxAlternatives: (options?.providerOptions?.maxAlternatives as number) ?? (providerConfig.maxAlternatives as number) ?? 1,
           abortSignal: abortController.signal,
+          onTranscriptionUpdate: text => streamingCallbacks.onTranscriptionUpdate(text),
           onSentenceEnd: (delta) => {
             if (abortController.signal.aborted)
               return
@@ -1174,20 +1181,23 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
           },
         })
 
+        // Recognition may fail while the user is still holding the button.
+        // Observe its result immediately; stop will still receive the rejection.
+        void result.text.catch((cause: unknown) => {
+          if (!abortController.signal.aborted)
+            error.value = errorMessage(cause)
+        })
+
         // Store session info for cleanup
-        const recognitionInstance = (result as any).recognition
         streamingSession.value = {
-          audioContext: {} as AudioContext, // Not used for Web Speech API
-          workletNode: {} as AudioWorkletNode, // Not used for Web Speech API
-          mediaStreamSource: {} as MediaStreamAudioSourceNode, // Not used for Web Speech API
           audioStreamController: undefined,
           abortController,
-          result: { ...result, mode: 'stream' as const, recognition: recognitionInstance },
+          result: { ...result, mode: 'stream' as const },
           idleTimer,
           mediaStream: stream,
           providerId,
           callbacks: streamingCallbacks,
-        } as any // Type assertion needed because recognition is extra
+        }
 
         // Initial idle timer (only if enabled)
         bumpIdle()
@@ -1325,4 +1335,6 @@ export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech
     stopStreamingTranscription,
     supportsStreamInput,
   }
-})
+}
+
+export const useHearingSpeechInputPipeline = defineStore('modules:hearing:speech:audio-input-pipeline', useTranscriptionSession)
