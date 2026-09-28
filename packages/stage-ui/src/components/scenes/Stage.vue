@@ -10,7 +10,7 @@ import type { EmotionPayload } from '../../constants/emotions'
 import type { SpeechTransport, StageTtsSession, StreamingSessionSnapshot } from '../../libs/speech/tts-session'
 
 import { defineInvokeHandler } from '@moeru/eventa'
-import { sleep } from '@moeru/std'
+import { errorMessageFrom, sleep } from '@moeru/std'
 import { createLive2DLipSync } from '@proj-airi/model-driver-lipsync'
 import { wlipsyncProfile } from '@proj-airi/model-driver-lipsync/shared/wlipsync'
 import { createPlaybackManager, createSpeechPipeline, normalizeActPayload } from '@proj-airi/pipelines-audio'
@@ -62,6 +62,7 @@ const props = withDefaults(defineProps<{
   paused: false,
 })
 
+const emit = defineEmits<{ error: [error: Error] }>()
 const componentState = defineModel<'pending' | 'loading' | 'mounted'>('state', { default: 'pending' })
 
 const { getDb } = useDuckDb()
@@ -185,6 +186,12 @@ const viewUpdateCleanups: Array<() => void> = []
 
 function handleStageRenderError(error: Error) {
   stageRenderError.value = error
+  emit('error', error)
+}
+
+function reportStageRenderError(error: unknown) {
+  console.error(error)
+  handleStageRenderError(error instanceof Error ? error : new Error(errorMessageFrom(error) ?? 'Failed to render stage'))
 }
 
 async function retryStageRenderer() {
@@ -1069,7 +1076,7 @@ defineExpose({
         :enable-orbit-controls="props.enableOrbitControls"
         :audio-context="audioContext"
         :current-audio-source="currentAudioSource"
-        @error="console.error"
+        @error="reportStageRenderError"
         @vrm-interact="onVRMInteract"
       />
       <SpineScene
@@ -1087,6 +1094,7 @@ defineExpose({
         :idle-animation-enabled="spineIdleAnimationEnabled"
         :max-fps="spineMaxFps"
         :render-scale="spineRenderScale"
+        @error="reportStageRenderError"
       />
       <TachieScene
         v-if="stageModelRenderer === 'tachie' && showStage"
@@ -1100,7 +1108,7 @@ defineExpose({
         :paused="paused"
         :theme-colors-hue="themeColorsHue"
         :theme-colors-hue-dynamic="themeColorsHueDynamic"
-        @error="console.error"
+        @error="reportStageRenderError"
       />
       <MMDScene
         v-if="stageModelRenderer === 'mmd' && showStage"
@@ -1116,7 +1124,7 @@ defineExpose({
         :enable-orbit-controls="props.enableOrbitControls"
         :audio-context="audioContext"
         :current-audio-source="currentAudioSource"
-        @error="console.error"
+        @error="reportStageRenderError"
       />
       <div
         v-if="stageModelRenderer === 'godot'"
@@ -1142,7 +1150,7 @@ defineExpose({
       <StageRenderError
         v-if="stageRenderError"
         :error="stageRenderError"
-        renderer="Live2D"
+        :renderer="stageModelRenderer === 'live2d' ? 'Live2D' : stageModelRenderer ?? 'Model'"
         :model-id="stageModelSelected"
         @retry="retryStageRenderer"
       />
